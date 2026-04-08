@@ -7,11 +7,12 @@
     "test": "jest --runInBand",
     "test:unit": "jest --runInBand GroupStateStore.test.ts",
     "test:integration": "jest --runInBand --config jest.integration.config.cjs integration.test.ts",
-    "example:worker:1": "cross-env WORKER_ID=worker-1 WORKER_INDEX=0 WORKER_COUNT=2 MAX_CONCURRENT_GROUPS=3 tsx example/worker.ts",
-    "example:worker:2": "cross-env WORKER_ID=worker-2 WORKER_INDEX=1 WORKER_COUNT=2 MAX_CONCURRENT_GROUPS=3 tsx example/worker.ts",
-    "example:worker:3": "cross-env WORKER_ID=worker-3 WORKER_INDEX=3 WORKER_COUNT=1 MAX_CONCURRENT_GROUPS=3 tsx example/worker.ts",
+    "example:worker:1": "cross-env WORKER_ID=worker-1 MAX_CONCURRENT_GROUPS=3 tsx example/worker.ts",
+    "example:worker:2": "cross-env WORKER_ID=worker-2 MAX_CONCURRENT_GROUPS=3 tsx example/worker.ts",
+    "example:worker:3": "cross-env WORKER_ID=worker-3 MAX_CONCURRENT_GROUPS=3 tsx example/worker.ts",
     "example:producer": "tsx example/producer.ts",
-    "example:report": "tsx example/report.ts"
+    "example:report": "tsx example/report.ts",
+    "example:db-clean": "tsx example/clean-db.ts"
   },
   "keywords": [],
   "author": "",

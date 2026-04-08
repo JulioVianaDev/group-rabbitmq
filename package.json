@@ -1,0 +1,36 @@
+{
+  "name": "files",
+  "version": "1.0.0",
+  "description": "A RabbitMQ library that adds **group-based ordering** and **per-worker concurrency limits** on top of standard AMQP queues.",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest --runInBand",
+    "test:unit": "jest --runInBand GroupStateStore.test.ts",
+    "test:integration": "jest --runInBand --config jest.integration.config.cjs integration.test.ts",
+    "example:worker:1": "cross-env WORKER_ID=worker-1 WORKER_INDEX=0 WORKER_COUNT=2 MAX_CONCURRENT_GROUPS=3 tsx example/worker.ts",
+    "example:worker:2": "cross-env WORKER_ID=worker-2 WORKER_INDEX=1 WORKER_COUNT=2 MAX_CONCURRENT_GROUPS=3 tsx example/worker.ts",
+    "example:worker:3": "cross-env WORKER_ID=worker-3 WORKER_INDEX=3 WORKER_COUNT=1 MAX_CONCURRENT_GROUPS=3 tsx example/worker.ts",
+    "example:producer": "tsx example/producer.ts",
+    "example:report": "tsx example/report.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "amqplib": "^0.10.9",
+    "ioredis": "^5.8.1",
+    "sqlite3": "^5.1.7",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.8",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^24.6.2",
+    "@types/uuid": "^10.0.0",
+    "cross-env": "^10.1.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.4.4",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

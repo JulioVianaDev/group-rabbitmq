@@ -21,7 +21,7 @@ const mockRedis = {
 
 jest.mock('ioredis', () => jest.fn().mockImplementation(() => mockRedis));
 
-import { GroupStateStore } from '../src/store/GroupStateStore';
+import { GroupStateStore } from './src/store/GroupStateStore';
 
 function makePipeline(execResult: unknown[][]) {
   const pipe = {

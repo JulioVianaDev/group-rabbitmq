@@ -1,9 +1,16 @@
 {
-  "name": "files",
+  "name": "@juliovianadev/group-rabbitmq",
   "version": "1.0.0",
   "description": "A RabbitMQ library that adds **group-based ordering** and **per-worker concurrency limits** on top of standard AMQP queues.",
-  "main": "index.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build",
     "test": "jest --runInBand",
     "test:unit": "jest --runInBand GroupStateStore.test.ts",
     "test:integration": "jest --runInBand --config jest.integration.config.cjs integration.test.ts",
@@ -14,9 +21,28 @@
     "example:report": "tsx example/report.ts",
     "example:db-clean": "tsx example/clean-db.ts"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "rabbitmq",
+    "amqp",
+    "redis",
+    "groups",
+    "ordering",
+    "message-queue"
+  ],
+  "author": "JulioVianaDev",
   "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JulioVianaDev/group-rabbitmq.git",
+    "directory": "node"
+  },
+  "bugs": {
+    "url": "https://github.com/JulioVianaDev/group-rabbitmq/issues"
+  },
+  "homepage": "https://github.com/JulioVianaDev/group-rabbitmq/tree/main/node#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "amqplib": "^0.10.9",
     "ioredis": "^5.8.1",

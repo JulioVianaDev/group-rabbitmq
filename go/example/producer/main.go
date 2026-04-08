@@ -8,7 +8,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/group-rabbitmq/group-rabbitmq-go/grouprabbitmq"
+	"github.com/JulioVianaDev/group-rabbitmq/go/grouprabbitmq"
 )
 
 func main() {

@@ -1,0 +1,50 @@
+# Creates git tags from node/package.json version on every push to main.
+# - vX.Y.Z   → npm / general releases
+# - go/vX.Y.Z → Go module under /go (required for go get)
+
+name: Tag release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version from node/package.json
+        id: meta
+        run: |
+          VERSION=$(node -p "require('./node/package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "go_tag=go/v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tags
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          GO_TAG: ${{ steps.meta.outputs.go_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists — skip (bump version in node/package.json for a new release)."
+            exit 0
+          fi
+          git tag -a "$TAG" -m "Release $TAG — npm @juliovianadev/group-rabbitmq@${VERSION}"
+          git tag -a "$GO_TAG" -m "Release $GO_TAG — Go module github.com/JulioVianaDev/group-rabbitmq/go@${VERSION}"
+          git push origin "$TAG" "$GO_TAG"

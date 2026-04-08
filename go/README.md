@@ -1,4 +1,4 @@
-# group-rabbitmq-go
+# group-rabbitmq (Go)
 
 Go **publisher** side that is **wire-compatible** with the Node library under `node/`:
 
@@ -54,6 +54,18 @@ This module currently provides a **Publisher** only. Full consumer parity in Go 
 
 ## Module path
 
-`github.com/group-rabbitmq/group-rabbitmq-go/grouprabbitmq`
+```
+github.com/JulioVianaDev/group-rabbitmq/go/grouprabbitmq
+```
 
-If you vendor or copy the repo, you can `replace` in your `go.mod` to point at this folder.
+Install a tagged version (tags look like `go/v1.0.0`):
+
+```bash
+go get github.com/JulioVianaDev/group-rabbitmq/go/grouprabbitmq@v1.0.0
+```
+
+For local development before publishing, use a `replace` directive in your `go.mod`:
+
+```go
+replace github.com/JulioVianaDev/group-rabbitmq/go => ../path/to/repo/go
+```

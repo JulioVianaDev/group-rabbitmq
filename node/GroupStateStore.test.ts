@@ -3,32 +3,32 @@
  */
 
 const mockRedis = {
-  connect:   jest.fn().mockResolvedValue(undefined),
-  quit:      jest.fn().mockResolvedValue(undefined),
+  connect: jest.fn().mockResolvedValue(undefined),
+  quit: jest.fn().mockResolvedValue(undefined),
   sismember: jest.fn(),
-  scard:     jest.fn(),
-  sadd:      jest.fn(),
-  srem:      jest.fn(),
-  smembers:  jest.fn(),
-  get:       jest.fn(),
-  set:       jest.fn(),
-  del:       jest.fn(),
-  pexpire:   jest.fn(),
-  incr:      jest.fn(),
-  eval:      jest.fn(),
-  pipeline:  jest.fn(),
+  scard: jest.fn(),
+  sadd: jest.fn(),
+  srem: jest.fn(),
+  smembers: jest.fn(),
+  get: jest.fn(),
+  set: jest.fn(),
+  del: jest.fn(),
+  pexpire: jest.fn(),
+  incr: jest.fn(),
+  eval: jest.fn(),
+  pipeline: jest.fn(),
 };
 
 jest.mock('ioredis', () => jest.fn().mockImplementation(() => mockRedis));
 
-import { GroupStateStore } from './src/store/GroupStateStore';
+import { GroupStateStore } from '../src/store/GroupStateStore';
 
 function makePipeline(execResult: unknown[][]) {
   const pipe = {
-    set:  jest.fn().mockReturnThis(),
+    set: jest.fn().mockReturnThis(),
     sadd: jest.fn().mockReturnThis(),
     srem: jest.fn().mockReturnThis(),
-    del:  jest.fn().mockReturnThis(),
+    del: jest.fn().mockReturnThis(),
     eval: jest.fn().mockReturnThis(),
     exec: jest.fn().mockResolvedValue(execResult),
   };
@@ -159,7 +159,7 @@ describe('GroupStateStore', () => {
       mockRedis.smembers.mockResolvedValue(['grp-A', 'grp-B']);
       const pipe = {
         eval: jest.fn().mockReturnThis(),
-        del:  jest.fn().mockReturnThis(),
+        del: jest.fn().mockReturnThis(),
         exec: jest.fn().mockResolvedValue([[1], [1], [1]]),
       };
       mockRedis.pipeline.mockReturnValue(pipe);

@@ -1,2 +1,5 @@
-/node_modules
-/example/consumption-log.sqlite
+/node/node_modules
+/node/example/consumption-log.sqlite
+
+/go/go.mod 
+/go/go.sum

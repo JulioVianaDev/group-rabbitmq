@@ -10,8 +10,8 @@
  *   npm run test:integration
  */
 
-import { GroupRabbitMQ } from './src';
-import { GroupStateStore } from './src/store/GroupStateStore';
+import { GroupRabbitMQ } from '../src';
+import { GroupStateStore } from '../src/store/GroupStateStore';
 
 const AMQP_URL = process.env.AMQP_URL ?? 'amqp://guest:guest@localhost:5672';
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://localhost:6379';
@@ -89,8 +89,8 @@ describe('GroupRabbitMQ — integration', () => {
       // Both started before either finished → they ran in parallel
       const aStart = startTimes['A'];
       const bStart = startTimes['B'];
-      const aEnd   = endTimes['A'];
-      const bEnd   = endTimes['B'];
+      const aEnd = endTimes['A'];
+      const bEnd = endTimes['B'];
 
       expect(aStart).toBeLessThan(bEnd);
       expect(bStart).toBeLessThan(aEnd);

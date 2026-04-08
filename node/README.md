@@ -10,6 +10,10 @@ A TypeScript library for **RabbitMQ** that combines:
 
 Dependencies: **RabbitMQ**, **Redis**, and (for discovery / balancing) the **RabbitMQ management plugin** (HTTP API on port `15672` in the default Docker image).
 
+### Go publishers (same queues as Node)
+
+A compatible **Go publisher** lives in [`../go/`](../go/README.md): it uses the same Redis sequence keys, exchange topology, and JSON envelope, so you can **publish from Go** and **consume with Node workers** without changing the consumer code. Run the example with `go run ./example/producer` from the `go` directory.
+
 ---
 
 ## Motivation

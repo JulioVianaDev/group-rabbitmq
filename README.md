@@ -1,194 +1,249 @@
-# group-rabbitmq
+# Group RabbitMQ
 
-A RabbitMQ library that adds **group-based ordering** and **per-worker concurrency limits** on top of standard AMQP queues.
+A TypeScript library for **RabbitMQ** that combines:
 
-## The problem it solves
+- **Per-group strict ordering** — messages with the same `groupId` are processed one after another.
+- **Parallelism across groups** — different `groupId`s can be processed at the same time.
+- **Per-process fan-out limit** — cap how many *distinct* groups one worker handles concurrently (`maxConcurrentGroups`).
+- **Cluster safety** — Redis-backed locks and slots so only one worker in the cluster owns a given group at a time.
+- **Optional horizontal scaling** — dynamic subscription balancing across processes when you enable **dynamic worker balancing** and the **management API**.
 
-Given messages:
-```ts
-[
-  { groupId: "item1", value: "batata" },
-  { groupId: "item2", value: "tomate" },
-  { groupId: "item1", value: "ariba"  },
-]
+Dependencies: **RabbitMQ**, **Redis**, and (for discovery / balancing) the **RabbitMQ management plugin** (HTTP API on port `15672` in the default Docker image).
+
+---
+
+## Motivation
+
+Typical AMQP usage is either “one queue, one consumer” (no parallelism) or “many consumers on one queue” (parallelism but **no ordering** per logical stream).
+
+Many domains need **both**:
+
+- Orders for **the same customer or aggregate** must be handled **in order**.
+- Work for **different** customers can run **in parallel**.
+
+This library models each `groupId` as its **own queue**, routes with a **direct exchange**, and uses **prefetch = 1 per group channel** so ordering is preserved per group while other groups are not blocked.
+
+It also uses **Redis** to:
+
+- Assign a **monotonic sequence number** per group (for observability and tests).
+- Track **which groups a worker is actively processing** and enforce **`maxConcurrentGroups`**.
+- Hold a **distributed lock per group** so that across machines, only one worker processes a given group at a time.
+
+---
+
+## Concepts
+
+| Concept | Meaning |
+|--------|---------|
+| **Group** | Identified by `groupId` (string). All messages for that id share one queue and one ordering stream. |
+| **Sequence** | Stored in Redis per group; incremented on publish so you can verify ordering and debug. |
+| **Worker** | One OS process running `GroupRabbitMQ` with a consumer. Identified by `workerId` (default: UUID). |
+| **Slot** | Permission for this worker to process another *new* group when under `maxConcurrentGroups`. |
+| **Lock** | Redis key per group so only one worker in the cluster processes that group at a time. |
+| **Dynamic worker balancing** | Optional mode: workers register in Redis; each group is assigned to exactly one worker by **consistent hashing** over live workers; subscriptions are updated on a timer. Requires **management URL** to list queues. |
+
+---
+
+## Architecture (high level)
+
+```
+Publishers                RabbitMQ                           Consumers
+    │                         │                                  │
+    │  routingKey = groupId   │   queue per group:               │
+    ├────────────────────────►│   {queuePrefix}.{groupId}        │
+    │                         │                                  │
+    │                         │   ◄── prefetch=1 per group       │
+    │                         │        (separate AMQP channel)   │
+    │                         │                                  │
+    │                         │                    Redis: locks,  │
+    │                         │                    slots, sequence│
 ```
 
-You want:
-- `item1/batata` and `item2/tomate` processed **in parallel** (different groups)
-- `item1/ariba` processed **after** `item1/batata` (same group → strict order)
-- A worker to process **at most N different groups** at the same time
+- **Exchange**: `direct` by default; `routingKey = groupId`.
+- **Queues**: `{queuePrefix}.{groupId}` (durable). Dead-letter exchange for poison / TTL.
+- **Single-active-consumer**: group queues are declared with `x-single-active-consumer` so if multiple workers *subscribe* to the same queue, RabbitMQ keeps **one active consumer** and ordering is not split across consumers on the same queue.
+
+---
+
+## Tradeoffs
+
+| Choice | Benefit | Cost |
+|--------|---------|------|
+| **One queue per group** | Strong ordering per group; natural isolation | Many queues if you have many groups; operations must tolerate queue proliferation |
+| **Redis for sequence + locks** | Fast coordination; survives restarts with persistence | Extra dependency; must size Redis and monitor |
+| **Prefetch 1 per group channel** | Simple serial processing per group | One channel per subscribed group per worker (more channels than a single shared consumer) |
+| **Dynamic balancing** | Add/remove workers; groups migrate by hash | Requires **management API**; periodic rebalance adds latency to ownership changes; **hash changes** when worker count changes (groups may move) |
+| **Consistent hashing** | Stable mapping given worker set | Not “fair” per message; hot groups stay on one worker |
+
+---
+
+## Limitations
+
+- **Group IDs are dynamic strings**: you must eventually **subscribe** to queues (manually or via `discovery` / **dynamic worker balancing**). Unknown groups do not create consumers until subscribed.
+- **Management API**: listing queues for discovery/balancing needs the plugin and correct URL/credentials.
+- **Rebalancing**: when worker count changes, **which worker owns a group** can change. In-flight work and queue depth must be acceptable for your use case.
+- **Ordering**: guaranteed **per group queue** for messages successfully consumed in order. Retries for capacity/lock use **delayed requeue** to avoid moving messages to the tail of the queue (which would break order).
+- **AMQP reconnect**: if the broker connection drops, the consumer must be recreated (the library clears the consumer on reconnect; you should reconnect and call `consume` / balancing again in your app if you design for long-lived auto-reconnect).
+- **Not a Kafka replacement**: this is AMQP + Redis patterns; throughput and retention semantics are those of RabbitMQ.
+
+---
 
 ## Install
 
 ```bash
-npm install group-rabbitmq
-# peer deps
-npm install amqplib ioredis
+npm install
+# runtime deps used by the library
+# amqplib, ioredis, uuid
 ```
+
+For local development, use Docker Compose (see below).
+
+---
 
 ## Quick start
 
 ```ts
-import { GroupRabbitMQ } from 'group-rabbitmq';
+import { GroupRabbitMQ } from './src'; // or your package name
 
 const mq = new GroupRabbitMQ({
-  amqpUrl: 'amqp://localhost',
-  redisUrl: 'redis://localhost',
+  amqpUrl: 'amqp://guest:guest@127.0.0.1:5672',
+  redisUrl: 'redis://127.0.0.1:6379',
 });
 
 await mq.connect();
 
-// Publish
 await mq.publish('order-1', { item: 'batata', qty: 3 });
-await mq.publish('order-1', { item: 'ariba',  qty: 1 }); // after batata
-await mq.publish('order-2', { item: 'tomate', qty: 5 }); // parallel to order-1
 
-// Consume — process at most 2 groups simultaneously on this worker
 await mq.consume(async (payload, ctx) => {
-  console.log(`[${ctx.groupId}] seq=${ctx.sequence}`, payload);
+  console.log(ctx.groupId, ctx.sequence, payload);
 }, { maxConcurrentGroups: 2 });
 
 await mq.subscribeToGroups(['order-1', 'order-2']);
+
+// ... later
+await mq.disconnect();
 ```
-
----
-
-## How it works
-
-### RabbitMQ topology
-
-```
-Producer
-  │  publish(groupId="item1", ...)
-  ▼
-group.exchange  (direct)
-  │  routingKey = groupId
-  ├──▶  queue: group.item1   (durable, FIFO)
-  ├──▶  queue: group.item2
-  └──▶  queue: group.itemN
-
-group.dlx  (fanout)
-  └──▶  queue: group.dead    (failed / expired messages)
-```
-
-Each `groupId` gets its own dedicated queue. The exchange routes by `routingKey = groupId`, so messages always land in the right group's queue.
-
-### How `prefetch=1` works here
-
-**`prefetch=1` does NOT lock the exchange or any other queue.**
-
-It is scoped to a single AMQP channel, and each group gets its own channel:
-
-```
-Worker process
-  ├── channel A  (prefetch=1)  ──▶  consumes group.item1
-  ├── channel B  (prefetch=1)  ──▶  consumes group.item2
-  └── channel C  (prefetch=1)  ──▶  consumes group.item3
-```
-
-Effect per channel:
-- RabbitMQ delivers **at most 1 unacked message** from that channel's queue
-- The next message is only delivered **after the current one is acked**
-- Other channels (other groups) are completely unaffected
-
-This means:
-- `item1` and `item2` run **in parallel** (different channels)
-- Within `item1`, messages run **serially** (same channel, prefetch=1)
-- A slow `item1` does not block `item2` at all
-
-### Concurrency limit (maxConcurrentGroups)
-
-Redis tracks which groups each worker is currently processing:
-
-```
-worker:{workerId}:active  →  SET { "item1", "item2" }
-group:{groupId}:lock      →  STRING "{workerId}"   (with TTL)
-```
-
-When a new message arrives for a **new** group:
-- If `|active| < maxConcurrentGroups` → acquire slot → process
-- If `|active| >= maxConcurrentGroups` → nack → republish after backoff delay
-
-When a message arrives for an **already active** group on this worker:
-- Always accepted immediately (no slot check needed)
-
-When a group's queue becomes empty after processing:
-- Slot is released → worker can now pick up a new group
-
-### Distributed lock (cluster safety)
-
-Each `groupId` has a Redis lock (`SET NX PX`). Only one worker in the cluster holds the lock for a given group at a time. If a worker crashes, the lock expires automatically (default: 60s) and another worker can take over.
 
 ---
 
 ## Configuration
 
-```ts
-const mq = new GroupRabbitMQ({
-  amqpUrl: 'amqp://localhost',          // required
-  redisUrl: 'redis://localhost',         // required
-  exchangeName: 'group.exchange',        // default
-  exchangeType: 'direct',               // 'direct' | 'topic'
-  queuePrefix: 'group',                 // queues named group.<groupId>
-  dlxExchangeName: 'group.dlx',         // dead-letter exchange
-  messageTtl: 1_800_000,               // 30min, before going to DLX
-  maxRequeueAttempts: 3,                // before giving up and DLX-ing
-  requeueDelayMs: 200,                  // base backoff (exponential)
-});
-```
+`GroupRabbitMQ` accepts:
 
-## Consume options
-
-```ts
-await mq.consume(handler, {
-  maxConcurrentGroups: 5,   // default: Infinity (no limit)
-  workerId: 'my-worker-1',  // default: auto uuid
-});
-```
-
-## Message context
-
-```ts
-await mq.consume(async (payload, ctx) => {
-  ctx.groupId    // e.g. "item1"
-  ctx.messageId  // unique UUID
-  ctx.sequence   // monotonic counter per group
-  ctx.publishedAt // ISO timestamp
-
-  // Soft requeue — put message back at END of group queue
-  await ctx.requeue();
-});
-```
-
-## Error handling
-
-- **Handler throws** → message sent to `group.dead` queue (DLX), slot released
-- **At capacity** → message requeued after exponential backoff, up to `maxRequeueAttempts`
-- **Worker crash** → Redis lock expires after 60s, another worker can acquire the group
-- **Broker restart** → queues and exchange are durable, messages survive
+| Field | Description |
+|-------|-------------|
+| `amqpUrl` | **Required.** AMQP connection string. |
+| `redisUrl` | **Required.** Used for sequence, locks, slots, and (optional) worker registry. |
+| `exchangeName` | Default: `group.exchange`. |
+| `exchangeType` | Default: `direct`. |
+| `queuePrefix` | Default: `group`. Queues: `{prefix}.{groupId}`. Also namespaces Redis keys for this deployment. |
+| `dlxExchangeName` | Default: `group.dlx`. Dead-letter exchange. |
+| `messageTtl` | Message TTL before DLX (ms). |
+| `maxRequeueAttempts` | Max retries when temporarily cannot lock / capacity. |
+| `requeueDelayMs` | Base delay for exponential backoff. |
+| `managementUrl` | e.g. `http://127.0.0.1:15672` — for `GroupDiscovery` and **dynamic worker balancing**. |
+| `managementUsername` / `managementPassword` | Optional; default `guest` / `guest`. |
+| `maxRetries` / `retryDelayMs` / `maxRetryDelayMs` | AMQP connection reconnect tuning. |
 
 ---
 
-## Running the example
+## Publishing
+
+```ts
+const msg = await mq.publish(groupId, payload, {
+  messageId: 'optional-id',
+  persistent: true,
+});
+// msg.sequence is per-group monotonic
+```
+
+`publishBatch` publishes multiple messages and assigns sequences per group.
+
+---
+
+## Consuming
+
+```ts
+await mq.consume(handler, {
+  workerId: 'my-worker',           // optional; default UUID
+  maxConcurrentGroups: 5,          // default: Infinity (no per-worker group cap)
+
+  // Optional: horizontal scaling + dynamic groups
+  dynamicWorkerBalancing: true,    // requires managementUrl
+  rebalanceIntervalMs: 5000,       // how often to re-run discovery + subscription map
+  workerHeartbeatTtlSec: 10,      // Redis liveness TTL for workers
+});
+```
+
+Handler receives `(payload, ctx)` where `ctx` includes `groupId`, `messageId`, `sequence`, `publishedAt`, and `requeue()` (basic requeue to the group queue).
+
+### Dynamic worker balancing
+
+When `dynamicWorkerBalancing: true`:
+
+- Each process registers in Redis under `{queuePrefix}:workers:active` and heartbeats under `{queuePrefix}:workers:heartbeat:{workerId}`.
+- On each rebalance tick, the library lists group queues via the **management API**, computes active workers, and assigns each `groupId` to a worker with **consistent hashing**: `hash(groupId) % N === slot` among sorted worker ids.
+- **Subscribe** to groups you own; **unsubscribe** from groups you no longer own.
+
+This requires **`managementUrl`** in the main config. Without it, `dynamicWorkerBalancing` throws.
+
+---
+
+## Discovery (without full balancing)
+
+If you only need to discover queue names:
+
+```ts
+const mq = new GroupRabbitMQ({ ..., managementUrl: 'http://127.0.0.1:15672' });
+await mq.connect();
+await mq.consume(handler);
+await mq.watchGroups(5000); // polls management API, subscribes as groups appear
+```
+
+---
+
+## Redis keys (namespaced by `queuePrefix`)
+
+All state keys are prefixed with `{queuePrefix}:` when `queuePrefix` is set (recommended).
+
+- `{queuePrefix}:worker:{workerId}:active` — set of group ids active on this worker.
+- `{queuePrefix}:group:{groupId}:lock` — distributed lock (TTL).
+- `{queuePrefix}:group:{groupId}:sequence` — sequence counter.
+- With balancing: `{queuePrefix}:workers:active`, `{queuePrefix}:workers:heartbeat:{workerId}`.
+
+---
+
+## Error handling (summary)
+
+- Handler throws → message rejected to DLX (no infinite loop); slot released.
+- At capacity / locked elsewhere → delayed **requeue** (in-order) up to `maxRequeueAttempts`, then DLX.
+- Worker crash → lock TTL expires; another worker can take the group.
+
+---
+
+## Local development
+
+### Docker Compose
 
 ```bash
-# Start dependencies
-docker run -d -p 5672:5672 -p 15672:15672 rabbitmq:3-management
-docker run -d -p 6379:6379 redis
-
-# Install and run
-npm install
-npx ts-node examples/basic-usage.ts
+docker compose up -d
 ```
 
-Expected output:
-```
-  [12:00:00.100] ▶ START  group=item1  seq=1  val=batata
-  [12:00:00.102] ▶ START  group=item2  seq=1  val=tomate   ← parallel
-  [12:00:00.600] ✓ END    group=item1  seq=1
-  [12:00:00.601] ▶ START  group=item1  seq=2  val=ariba    ← next in order
-  [12:00:00.703] ✓ END    group=item2  seq=1
-  [12:00:00.703] ▶ START  group=item3  seq=1  val=cebola   ← slot freed
-  [12:00:01.100] ✓ END    group=item1  seq=2
-  [12:00:00.900] ✓ END    group=item3  seq=1
-```
+Starts RabbitMQ (AMQP `5672`, management `15672`) and Redis (`6379`).
+
+### Scripts
+
+| Command | Purpose |
+|---------|---------|
+| `npm test` | Unit tests |
+| `npm run test:integration` | Integration tests (needs broker + Redis) |
+| `npm run example:producer` | Example publisher |
+| `npm run example:worker:1` … `:3` | Example workers (with `dynamicWorkerBalancing` in code) |
+| `npm run example:report` | SQLite consumption report (example only) |
+| `npm run example:db-clean` | Clear example SQLite log |
+
+---
+
+## License
+
+ISC (see `package.json`).

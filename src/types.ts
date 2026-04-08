@@ -21,6 +21,16 @@ export interface PublishOptions {
 export interface ConsumeOptions {
   maxConcurrentGroups?: number;
   workerId?: string;
+  /**
+   * When true, registers this process in Redis and periodically subscribes/unsubscribes
+   * to group queues so each group is owned by exactly one worker (consistent hashing).
+   * Requires `managementUrl` on the main config. Use for horizontal scaling with dynamic groups.
+   */
+  dynamicWorkerBalancing?: boolean;
+  /** How often to re-run discovery + subscription mapping. Default: 5000 */
+  rebalanceIntervalMs?: number;
+  /** Redis heartbeat TTL for liveness (seconds). Default: 10 */
+  workerHeartbeatTtlSec?: number;
 }
 
 export interface GroupMessage<T = unknown> {

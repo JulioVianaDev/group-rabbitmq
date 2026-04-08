@@ -12,6 +12,7 @@ import { GroupMonitor } from './monitor/GroupMonitor';
 import { GroupPublisher } from './publisher/GroupPublisher';
 import { GroupStateStore } from './store/GroupStateStore';
 import { TopologyManager } from './topology/TopologyManager';
+import { WorkerClusterBalancer } from './balancer/WorkerClusterBalancer';
 
 const DEFAULT_CONFIG: Omit<Required<GroupRabbitMQConfig>, 'amqpUrl' | 'redisUrl'> = {
   exchangeName: 'group.exchange',
@@ -45,6 +46,7 @@ export class GroupRabbitMQ<T = unknown> {
 
   private _discovery: GroupDiscovery | null = null;
   private _monitor: GroupMonitor | null = null;
+  private _balancer: WorkerClusterBalancer | null = null;
 
   constructor(config: GroupRabbitMQFullConfig) {
     this.fullConfig = config;
@@ -70,6 +72,10 @@ export class GroupRabbitMQ<T = unknown> {
         await this.publisher.close().catch(() => undefined);
         this.publisher = null;
       }
+      if (this._balancer) {
+        await this._balancer.stop().catch(() => undefined);
+        this._balancer = null;
+      }
       if (this.consumer) {
         console.warn('[group-rabbitmq] Reconnected — consumer channels need re-init');
         await this.consumer.close().catch(() => undefined);
@@ -88,6 +94,10 @@ export class GroupRabbitMQ<T = unknown> {
   }
 
   async disconnect(): Promise<void> {
+    if (this._balancer) {
+      await this._balancer.stop().catch(() => undefined);
+      this._balancer = null;
+    }
     this._discovery?.stopWatching();
     this._monitor?.stopLogging();
     if (this.consumer) { await this.consumer.close(); this.consumer = null; }
@@ -110,6 +120,23 @@ export class GroupRabbitMQ<T = unknown> {
     this.consumer = new GroupConsumer<T>(this.config, this.topology, this.store, conn, handler, options);
     await this.consumer.initialize();
     this._monitor = new GroupMonitor(this.store, this.consumer.id, options.maxConcurrentGroups ?? Infinity, this._discovery ?? undefined);
+
+    if (options.dynamicWorkerBalancing) {
+      if (!this._discovery) {
+        throw new Error('[group-rabbitmq] dynamicWorkerBalancing requires managementUrl in config.');
+      }
+      this._balancer = new WorkerClusterBalancer({
+        redisUrl: this.config.redisUrl,
+        queuePrefix: this.config.queuePrefix,
+        workerId: this.consumer.id,
+        rebalanceIntervalMs: options.rebalanceIntervalMs,
+        workerHeartbeatTtlSec: options.workerHeartbeatTtlSec,
+        discoverGroups: () => this._discovery!.discoverGroups(),
+        subscribeToGroup: (groupId) => this.subscribeToGroup(groupId),
+        unsubscribeFromGroup: (groupId) => this.unsubscribeFromGroup(groupId),
+      });
+      await this._balancer.start();
+    }
   }
 
   async subscribeToGroups(groupIds: string[]): Promise<void> {

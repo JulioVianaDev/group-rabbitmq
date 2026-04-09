@@ -45,6 +45,6 @@ jobs:
             echo "Tag $TAG already exists — skip (bump version in node/package.json for a new release)."
             exit 0
           fi
-          git tag -a "$TAG" -m "Release $TAG — npm @juliovianadev/group-rabbitmq@${VERSION}"
+          git tag -a "$TAG" -m "Release $TAG — npm group-rabbitmq@${VERSION}"
           git tag -a "$GO_TAG" -m "Release $GO_TAG — Go module github.com/JulioVianaDev/group-rabbitmq/go@${VERSION}"
           git push origin "$TAG" "$GO_TAG"

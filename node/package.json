@@ -1,6 +1,6 @@
 {
   "name": "group-rabbitmq",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A RabbitMQ library that adds **group-based ordering** and **per-worker concurrency limits** on top of standard AMQP queues.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

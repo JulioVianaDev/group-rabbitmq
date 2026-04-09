@@ -9,7 +9,7 @@ Monorepo: **Node.js** library in [`node/`](./node/) and **Go** publisher in [`go
 ### npm (TypeScript / JavaScript)
 
 ```bash
-npm install @juliovianadev/group-rabbitmq
+npm install group-rabbitmq
 ```
 
 Package root is the [`node/`](./node/) folder (`repository.directory` in `package.json`).

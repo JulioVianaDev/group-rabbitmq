@@ -14,7 +14,7 @@ Dependencies: **RabbitMQ**, **Redis**, and (for discovery / balancing) the **Rab
 
 A compatible **Go publisher** lives in [`../go/`](../go/README.md): it uses the same Redis sequence keys, exchange topology, and JSON envelope, so you can **publish from Go** and **consume with Node workers** without changing the consumer code. Run the example with `go run ./example/producer` from the `go` directory.
 
-**npm package:** [`@juliovianadev/group-rabbitmq`](https://www.npmjs.com/package/@juliovianadev/group-rabbitmq) (published from the `node/` directory).
+**npm package:** [`group-rabbitmq`](https://www.npmjs.com/package/group-rabbitmq) (published from the `node/` directory).
 
 ---
 
@@ -96,10 +96,10 @@ Publishers                RabbitMQ                           Consumers
 
 ## Install
 
-From [npm](https://www.npmjs.com/package/@juliovianadev/group-rabbitmq) (package is published from the `node/` folder in the repo):
+From [npm](https://www.npmjs.com/package/group-rabbitmq) (package is published from the `node/` folder in the repo):
 
 ```bash
-npm install @juliovianadev/group-rabbitmq
+npm install group-rabbitmq
 ```
 
 Peer-style runtime dependencies are bundled; you need **RabbitMQ** and **Redis** at runtime.
@@ -111,7 +111,7 @@ For local development of this repo, use `npm install` inside `node/` and Docker 
 ## Quick start
 
 ```ts
-import { GroupRabbitMQ } from '@juliovianadev/group-rabbitmq';
+import { GroupRabbitMQ } from 'group-rabbitmq';
 
 const mq = new GroupRabbitMQ({
   amqpUrl: 'amqp://guest:guest@127.0.0.1:5672',

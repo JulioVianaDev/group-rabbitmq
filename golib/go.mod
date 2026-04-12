@@ -1,4 +1,4 @@
-module github.com/JulioVianaDev/group-rabbitmq/go
+module github.com/JulioVianaDev/group-rabbitmq/golib
 
 go 1.21
 

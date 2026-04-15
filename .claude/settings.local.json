@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls 'C:\\\\Users\\\\Admin\\\\Downloads\\\\files\\\\'*.md)",
+      "Bash(ls 'C:\\\\Users\\\\Admin\\\\Downloads\\\\files\\\\node\\\\'*.md)",
+      "Bash(ls:*)"
+    ]
+  }
+}

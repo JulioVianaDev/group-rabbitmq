@@ -119,7 +119,7 @@ export class GroupRabbitMQ<T = unknown> {
     const conn = this.connectionManager.currentConnection!;
     this.consumer = new GroupConsumer<T>(this.config, this.topology, this.store, conn, handler, options);
     await this.consumer.initialize();
-    this._monitor = new GroupMonitor(this.store, this.consumer.id, options.maxConcurrentGroups ?? Infinity, this._discovery ?? undefined);
+    this._monitor = new GroupMonitor(this.store, this.consumer.id, options.maxConcurrentGroups ?? 100, this._discovery ?? undefined);
 
     if (options.dynamicWorkerBalancing) {
       if (!this._discovery) {

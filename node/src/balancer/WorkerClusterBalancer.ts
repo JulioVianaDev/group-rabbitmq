@@ -42,6 +42,8 @@ export class WorkerClusterBalancer {
   private readonly subscribedGroups = new Set<string>();
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private rebalanceTimer: NodeJS.Timeout | null = null;
+  private rebalancing = false;
+  private stopped = false;
   private readonly opts: Required<
     Pick<WorkerClusterBalancerOptions, 'rebalanceIntervalMs' | 'workerHeartbeatTtlSec'>
   > &
@@ -95,28 +97,43 @@ export class WorkerClusterBalancer {
     };
 
     const rebalance = async (): Promise<void> => {
-      let groups: string[];
+      if (this.rebalancing || this.stopped) return; // re-entrancy guard
+      this.rebalancing = true;
       try {
-        groups = await this.opts.discoverGroups();
-      } catch (err) {
-        this.log(`discoverGroups failed: ${(err as Error).message}`);
-        return;
-      }
-      const activeWorkers = await getActiveWorkers();
-
-      for (const groupId of groups) {
-        const iOwn = shouldThisWorkerOwnGroup(groupId, this.opts.workerId, activeWorkers);
-        const isSub = this.subscribedGroups.has(groupId);
-
-        if (iOwn && !isSub) {
-          await this.opts.subscribeToGroup(groupId);
-          this.subscribedGroups.add(groupId);
-          this.log(`subscribed group=${groupId} workers=${activeWorkers.join(',')}`);
-        } else if (!iOwn && isSub) {
-          await this.opts.unsubscribeFromGroup(groupId);
-          this.subscribedGroups.delete(groupId);
-          this.log(`unsubscribed group=${groupId} workers=${activeWorkers.join(',')}`);
+        let groups: string[];
+        try {
+          groups = await this.opts.discoverGroups();
+        } catch (err) {
+          this.log(`discoverGroups failed: ${(err as Error).message}`);
+          return;
         }
+        const activeWorkers = await getActiveWorkers();
+
+        for (const groupId of groups) {
+          if (this.stopped) return;
+          const iOwn = shouldThisWorkerOwnGroup(groupId, this.opts.workerId, activeWorkers);
+          const isSub = this.subscribedGroups.has(groupId);
+
+          if (iOwn && !isSub) {
+            try {
+              await this.opts.subscribeToGroup(groupId);
+              this.subscribedGroups.add(groupId);
+              this.log(`subscribed group=${groupId} workers=${activeWorkers.join(',')}`);
+            } catch (err) {
+              this.log(`subscribe failed group=${groupId}: ${(err as Error).message}`);
+            }
+          } else if (!iOwn && isSub) {
+            try {
+              await this.opts.unsubscribeFromGroup(groupId);
+              this.subscribedGroups.delete(groupId);
+              this.log(`unsubscribed group=${groupId} workers=${activeWorkers.join(',')}`);
+            } catch (err) {
+              this.log(`unsubscribe failed group=${groupId}: ${(err as Error).message}`);
+            }
+          }
+        }
+      } finally {
+        this.rebalancing = false;
       }
     };
 
@@ -137,6 +154,7 @@ export class WorkerClusterBalancer {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -144,6 +162,13 @@ export class WorkerClusterBalancer {
     if (this.rebalanceTimer) {
       clearInterval(this.rebalanceTimer);
       this.rebalanceTimer = null;
+    }
+    // Unsubscribe from every group we owned so other workers can pick them up
+    // immediately, instead of waiting for the heartbeat TTL.
+    const owned = [...this.subscribedGroups];
+    this.subscribedGroups.clear();
+    for (const g of owned) {
+      await this.opts.unsubscribeFromGroup(g).catch(() => undefined);
     }
     await this.redis.del(this.heartbeatKey).catch(() => undefined);
     await this.redis.srem(this.workersSetKey, this.opts.workerId).catch(() => undefined);

@@ -58,43 +58,68 @@ export class GroupStateStore {
     const lockKey = this.lockKey(groupId);
     const activeKey = this.activeKey(workerId);
 
-    // Check if this worker already owns this group
+    // Fast path compatibility: if the local active set says "mine" AND the lock
+    // is still owned by us, extend the TTL. If the lock was taken by another
+    // worker (TTL expired during a pause), drop the stale entry and fall
+    // through to the atomic acquire so we cannot refresh someone else's lock.
     const isAlreadyMine = await this.redis.sismember(activeKey, groupId);
     if (isAlreadyMine) {
-      // Refresh the lock TTL so it doesn't expire mid-processing
-      await this.redis.pexpire(lockKey, this.LOCK_TTL_MS);
-      return 'already_mine';
-    }
-
-    // Check if another worker owns this group's distributed lock
-    const existingOwner = await this.redis.get(lockKey);
-    if (existingOwner && existingOwner !== workerId) {
-      return 'locked_elsewhere';
-    }
-
-    // Check if this worker has capacity for a new group
-    const activeCount = await this.redis.scard(activeKey);
-    if (activeCount >= maxConcurrentGroups) {
-      return 'at_capacity';
-    }
-
-    // Atomically set distributed lock + add to worker's active set
-    // Using a pipeline ensures both operations succeed or both fail
-    const pipeline = this.redis.pipeline();
-    pipeline.set(lockKey, workerId, 'PX', this.LOCK_TTL_MS, 'NX');
-    pipeline.sadd(activeKey, groupId);
-    const results = await pipeline.exec();
-
-    // results[0] = SET NX result: "OK" if acquired, null if already locked
-    const lockResult = results?.[0]?.[1];
-    if (lockResult === null) {
-      // Another worker sneaked in between our check and set (race condition)
-      // Rollback the SADD
+      const owner = await this.redis.get(lockKey);
+      if (owner === workerId) {
+        await this.redis.pexpire(lockKey, this.LOCK_TTL_MS);
+        return 'already_mine';
+      }
+      // Stale local state — remove before re-acquiring via the atomic script.
       await this.redis.srem(activeKey, groupId);
-      return 'locked_elsewhere';
     }
 
-    return 'acquired';
+    // Atomic check-and-set via Lua: verify lock owner, enforce capacity,
+    // acquire lock, and add to active set in one round trip. This closes the
+    // TOCTOU race between SCARD and SADD that allowed exceeding the cap.
+    //
+    // KEYS[1] = lockKey
+    // KEYS[2] = activeKey
+    // ARGV[1] = workerId
+    // ARGV[2] = maxConcurrentGroups (stringified int)
+    // ARGV[3] = lockTtlMs (stringified int)
+    // ARGV[4] = groupId
+    // Returns: "acquired" | "already_mine" | "locked_elsewhere" | "at_capacity"
+    const script = `
+      local owner = redis.call("GET", KEYS[1])
+      if owner and owner ~= ARGV[1] then
+        return "locked_elsewhere"
+      end
+      if owner == ARGV[1] then
+        if redis.call("SISMEMBER", KEYS[2], ARGV[4]) == 1 then
+          redis.call("PEXPIRE", KEYS[1], tonumber(ARGV[3]))
+          return "already_mine"
+        end
+      end
+      local max = tonumber(ARGV[2])
+      local count = redis.call("SCARD", KEYS[2])
+      if count >= max then
+        return "at_capacity"
+      end
+      redis.call("SET", KEYS[1], ARGV[1], "PX", tonumber(ARGV[3]))
+      redis.call("SADD", KEYS[2], ARGV[4])
+      return "acquired"
+    `;
+
+    const maxArg =
+      maxConcurrentGroups === Infinity ? '2147483647' : String(maxConcurrentGroups);
+
+    const result = (await this.redis.eval(
+      script,
+      2,
+      lockKey,
+      activeKey,
+      workerId,
+      maxArg,
+      String(this.LOCK_TTL_MS),
+      groupId
+    )) as string;
+
+    return result as 'acquired' | 'already_mine' | 'locked_elsewhere' | 'at_capacity';
   }
 
   /**

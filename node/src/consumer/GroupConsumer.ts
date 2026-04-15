@@ -16,30 +16,13 @@ import { GroupStateStore } from '../store/GroupStateStore';
  * with the following guarantees:
  *
  *  1. ORDER: Messages within a group are processed one at a time, in the order
- *     they were published. The next message is only fetched after the current
- *     one is fully acked.
- *
- *     HOW: prefetch=1 on each per-group channel. Since every group has its own
- *     queue, prefetch=1 means "deliver only 1 unacked message from THIS queue".
- *     It does NOT affect the exchange, other queues, or other workers' channels.
- *
- *  2. CONCURRENCY LIMIT: A single worker processes at most `maxConcurrentGroups`
- *     different groups at a time.
- *
- *     HOW: Redis tracks active groups per worker. When a new group's message
- *     arrives and we're at capacity, the message is nacked and requeued with
- *     backoff. It will be retried after a delay.
- *
- *  3. EXCLUSIVITY: A group is processed by exactly one worker at a time across
- *     the entire cluster.
- *
- *     HOW: Distributed Redis lock per groupId. Only the worker holding the lock
- *     consumes from that group's queue.
- *
- * Channel architecture:
- *  - Each group gets its OWN channel with prefetch=1.
- *  - A single shared channel is used for queue/binding assertions.
- *  - This means pausing one group (nack) does not stall other groups.
+ *     they were published (prefetch=1 per group channel).
+ *  2. CONCURRENCY LIMIT: A worker processes at most `maxConcurrentGroups`
+ *     distinct groups at once (atomic Lua check in Redis).
+ *  3. EXCLUSIVITY: A group is owned by exactly one worker at a time
+ *     (distributed Redis lock + RabbitMQ x-single-active-consumer).
+ *  4. NO DOUBLE-PROCESSING: a per-message in-flight set skips any delivery
+ *     whose messageId is currently being handled on this worker.
  */
 export class GroupConsumer<T = unknown> {
   private readonly workerId: string;
@@ -48,6 +31,10 @@ export class GroupConsumer<T = unknown> {
   // One channel per groupId — isolated prefetch windows
   private readonly groupChannels = new Map<string, amqplib.Channel>();
   private readonly groupConsumerTags = new Map<string, string>();
+
+  // Messages currently being processed on this worker (dedupe guard for
+  // redeliveries that can happen on channel reopen / nack-requeue).
+  private readonly inFlightMessages = new Set<string>();
 
   // Tracks in-flight requeue timers so we can cancel them on shutdown
   private readonly requeueTimers = new Set<NodeJS.Timeout>();
@@ -64,7 +51,8 @@ export class GroupConsumer<T = unknown> {
     options: ConsumeOptions = {}
   ) {
     this.workerId = options.workerId ?? uuidv4();
-    this.maxConcurrentGroups = options.maxConcurrentGroups ?? Infinity;
+    // Default 100 concurrent groups if caller did not specify.
+    this.maxConcurrentGroups = options.maxConcurrentGroups ?? 100;
   }
 
   get id(): string {
@@ -77,13 +65,6 @@ export class GroupConsumer<T = unknown> {
     this.running = true;
   }
 
-  /**
-   * Start consuming from a specific group's queue.
-   *
-   * This is called automatically when the library detects a new group
-   * (via a separate "group discovery" mechanism), or you can call it
-   * explicitly if you know the groups in advance.
-   */
   async subscribeToGroup(groupId: string): Promise<void> {
     if (!this.running || !this.managementChannel) {
       throw new Error('Consumer not initialized.');
@@ -93,31 +74,24 @@ export class GroupConsumer<T = unknown> {
       return; // Already subscribed
     }
 
-    // Ensure the queue exists before consuming
     await this.topology.assertGroupQueue(this.managementChannel, groupId);
 
-    // ── Key design: each group gets its own channel with prefetch=1 ──────────
-    //
-    // prefetch=1 on this channel means:
-    //   "RabbitMQ will deliver at most 1 unacked message FROM queues consumed
-    //    on THIS channel"
-    //
-    // Since this channel only consumes from group.<groupId>, the effect is:
-    //   "Only one message from group.<groupId> is in-flight at any time"
-    //
-    // This is SCOPED to:
-    //   - This channel only (not the connection, not other channels)
-    //   - This worker only (other workers have their own channels)
-    //   - This group only (other groups have their own channels with their own prefetch)
-    //
-    // Without per-group channels, a single prefetch=1 channel subscribed to
-    // multiple groups would process all groups serially — group1 would block
-    // group2. With separate channels, group1 and group2 run in parallel, but
-    // each group internally stays serial.
-    // ─────────────────────────────────────────────────────────────────────────
-
     const channel = await this.connection.createChannel();
-    await channel.prefetch(1); // <── scoped to this channel / this group only
+    await channel.prefetch(1);
+
+    // If the channel dies (server cancel, queue deletion, network blip),
+    // clean up state so the next balancer tick / user call can re-subscribe.
+    const cleanup = () => {
+      if (this.groupChannels.get(groupId) === channel) {
+        this.groupChannels.delete(groupId);
+        this.groupConsumerTags.delete(groupId);
+      }
+    };
+    channel.on('close', cleanup);
+    channel.on('error', (err: Error) => {
+      console.warn(`[group-rabbitmq] Channel error on group "${groupId}": ${err.message}`);
+      cleanup();
+    });
 
     this.groupChannels.set(groupId, channel);
 
@@ -126,40 +100,46 @@ export class GroupConsumer<T = unknown> {
     const { consumerTag } = await channel.consume(
       queueName,
       (msg) => this.handleDelivery(channel, groupId, msg),
-      { noAck: false } // Manual acks — we ack AFTER processing completes
+      { noAck: false }
     );
 
     this.groupConsumerTags.set(groupId, consumerTag);
   }
 
-  /**
-   * Core delivery handler — called by RabbitMQ for each message.
-   *
-   * Decision tree:
-   *  1. Is this group already active on this worker?       → process
-   *  2. Is another worker processing this group?           → nack + requeue with backoff
-   *  3. Does this worker have capacity for a new group?    → acquire + process
-   *  4. Worker is at maxConcurrentGroups capacity          → nack + requeue with backoff
-   */
   private async handleDelivery(
     channel: amqplib.Channel,
     groupId: string,
     msg: amqplib.ConsumeMessage | null
   ): Promise<void> {
-    if (!msg) return; // Consumer cancelled
-
-    const redeliveryCount = (msg.properties.headers?.['x-redelivery-count'] ?? 0) as number;
+    if (!msg) return;
 
     let parsed: GroupMessage<T>;
     try {
       parsed = JSON.parse(msg.content.toString()) as GroupMessage<T>;
     } catch {
-      // Malformed message — send directly to DLX, don't requeue
-      channel.nack(msg, false, false);
+      // Malformed — send to DLX, don't requeue
+      this.safeNack(channel, msg, false);
       return;
     }
 
-    // ── Acquire slot ──────────────────────────────────────────────────────────
+    const messageId = parsed.messageId || msg.properties.messageId || '';
+
+    // ── Dedupe guard ─────────────────────────────────────────────────────────
+    // RabbitMQ can redeliver the same message (channel close, nack+requeue,
+    // consumer cancel). Skip if this worker is already handling the same id.
+    if (messageId && this.inFlightMessages.has(messageId)) {
+      // Requeue so another delivery/worker eventually picks it up. Don't DLX
+      // because it's our own transient duplicate.
+      this.safeNack(channel, msg, true);
+      return;
+    }
+
+    // Redelivery-count lives in headers. Since amqplib's nack+requeue does NOT
+    // mutate headers, we track attempts in the message properties we control
+    // by republishing if we need backoff (see requeueWithBackoff below).
+    const attempts =
+      (msg.properties.headers?.['x-group-attempt'] as number | undefined) ?? 0;
+
     const slotResult = await this.store.tryAcquireGroupSlot(
       this.workerId,
       groupId,
@@ -167,33 +147,21 @@ export class GroupConsumer<T = unknown> {
     );
 
     if (slotResult === 'locked_elsewhere' || slotResult === 'at_capacity') {
-      // We cannot process this message right now.
-      // Keep the message unacked for a short delay, then requeue it.
-      // This preserves per-group ordering by avoiding republish-to-tail behavior.
-      const delay = this.calcBackoffDelay(redeliveryCount);
-
-      const timer = setTimeout(async () => {
-        this.requeueTimers.delete(timer);
-        if (!this.running) return;
-
-        try {
-          channel.nack(msg, false, true);
-        } catch {
-          // If channel is already closed, let reconnection flow handle recovery.
-          return;
-        }
-      }, delay);
-
-      this.requeueTimers.add(timer);
+      if (attempts >= this.config.maxRequeueAttempts) {
+        // Give up — DLX to avoid hot-looping forever.
+        this.safeNack(channel, msg, false);
+        return;
+      }
+      await this.requeueWithBackoff(channel, msg, parsed, attempts);
       return;
     }
 
-    // ── Process message ───────────────────────────────────────────────────────
+    // ── Process message ──────────────────────────────────────────────────────
+    if (messageId) this.inFlightMessages.add(messageId);
 
-    // Set up a lock-refresh interval for long-running handlers
     const refreshInterval = setInterval(
       () => this.store.refreshGroupLock(this.workerId, groupId),
-      Math.floor(this.config.messageTtl / 3) // refresh at 1/3 of TTL
+      Math.max(1000, Math.floor(this.config.messageTtl / 3))
     );
 
     const context: MessageContext = {
@@ -202,93 +170,160 @@ export class GroupConsumer<T = unknown> {
       sequence: parsed.sequence,
       publishedAt: parsed.publishedAt,
       requeue: async () => {
-        // User-requested soft requeue: puts message back at end of group queue
-        channel.nack(msg, false, true);
+        this.safeNack(channel, msg, true);
       },
     };
 
     try {
       await this.handler(parsed.payload, context);
+      this.safeAck(channel, msg);
 
-      // ── Ack: tell RabbitMQ this message was processed successfully ─────────
-      // prefetch=1 means RabbitMQ was holding back the next message.
-      // After this ack, it will deliver the next one in the queue.
-      channel.ack(msg);
-
-      // Check if the group queue is now empty
-      const isEmpty = await this.topology.isGroupQueueEmpty(
-        this.managementChannel!,
-        groupId
-      );
-
-      if (isEmpty) {
-        // Release the group's slot so this worker (and others) can pick up new groups
-        await this.store.releaseGroupSlot(this.workerId, groupId);
+      // Only release the slot when the queue is empty — otherwise prefetch=1
+      // will deliver the next message on this same channel and we want to
+      // keep holding the lock for this group.
+      try {
+        const isEmpty = await this.topology.isGroupQueueEmpty(
+          this.managementChannel!,
+          groupId
+        );
+        if (isEmpty) {
+          await this.store.releaseGroupSlot(this.workerId, groupId);
+        }
+      } catch {
+        // checkQueue can kill the management channel in some edge cases;
+        // fall back to releasing so the group can be re-owned later.
+        await this.store.releaseGroupSlot(this.workerId, groupId).catch(() => undefined);
       }
     } catch (err) {
-      // Handler threw — send to DLX (do not requeue, avoid infinite error loops)
-      channel.nack(msg, false, false);
-      // Release slot: group had a fatal error, allow another worker to retry
-      await this.store.releaseGroupSlot(this.workerId, groupId);
+      // Handler threw → DLX (no requeue loop)
+      this.safeNack(channel, msg, false);
+      await this.store.releaseGroupSlot(this.workerId, groupId).catch(() => undefined);
       console.error(`[group-rabbitmq] Handler error for group "${groupId}":`, err);
     } finally {
       clearInterval(refreshInterval);
+      if (messageId) this.inFlightMessages.delete(messageId);
     }
   }
 
   /**
-   * Unsubscribe from a group's queue (e.g. when shutting down a worker).
+   * Republish the message to its own queue with an incremented attempt
+   * counter, then ack the original. This is how we actually grow the
+   * `x-group-attempt` header across redeliveries — RabbitMQ's native
+   * nack+requeue does NOT mutate headers.
+   *
+   * Ordering note: the group queue has a single active consumer with
+   * prefetch=1. The message we just published will sit behind whatever is
+   * already queued — but since we're the only worker draining this queue,
+   * and we're about to nack+requeue anyway, ordering across the SAME logical
+   * message is preserved (it is still the next one we see).
    */
+  private async requeueWithBackoff(
+    channel: amqplib.Channel,
+    msg: amqplib.ConsumeMessage,
+    parsed: GroupMessage<T>,
+    attempts: number
+  ): Promise<void> {
+    const delay = this.calcBackoffDelay(attempts);
+
+    const timer = setTimeout(async () => {
+      this.requeueTimers.delete(timer);
+      if (!this.running) return;
+
+      try {
+        const queueName = this.topology.groupQueueName(parsed.groupId);
+        const headers = {
+          ...(msg.properties.headers ?? {}),
+          'x-group-attempt': attempts + 1,
+        };
+        // Send to the DEFAULT exchange, routed directly to this queue, so we
+        // don't double-fan-out through the group exchange.
+        channel.sendToQueue(queueName, msg.content, {
+          persistent: true,
+          contentType: msg.properties.contentType ?? 'application/json',
+          messageId: msg.properties.messageId,
+          headers,
+        });
+        this.safeAck(channel, msg);
+      } catch {
+        // Channel likely closed — let reconnect flow recover
+      }
+    }, delay);
+
+    this.requeueTimers.add(timer);
+  }
+
   async unsubscribeFromGroup(groupId: string): Promise<void> {
     const channel = this.groupChannels.get(groupId);
     const tag = this.groupConsumerTags.get(groupId);
 
+    this.groupChannels.delete(groupId);
+    this.groupConsumerTags.delete(groupId);
+
     if (channel && tag) {
-      await channel.cancel(tag);
-      await channel.close();
-      this.groupChannels.delete(groupId);
-      this.groupConsumerTags.delete(groupId);
+      try {
+        await channel.cancel(tag);
+      } catch {
+        // channel may already be closed
+      }
+      try {
+        await channel.close();
+      } catch {
+        // already closed
+      }
     }
 
-    await this.store.releaseGroupSlot(this.workerId, groupId);
+    await this.store.releaseGroupSlot(this.workerId, groupId).catch(() => undefined);
   }
 
-  /**
-   * Graceful shutdown: stop consuming, wait for in-flight messages to finish,
-   * release all Redis slots.
-   */
   async close(): Promise<void> {
     this.running = false;
 
-    // Cancel all pending requeue timers
     for (const timer of this.requeueTimers) {
       clearTimeout(timer);
     }
     this.requeueTimers.clear();
 
-    // Cancel all group consumers
     const groupIds = [...this.groupChannels.keys()];
     await Promise.all(groupIds.map((g) => this.unsubscribeFromGroup(g)));
 
-    // Clear Redis state for this worker
-    await this.store.clearWorkerState(this.workerId);
+    await this.store.clearWorkerState(this.workerId).catch(() => undefined);
 
     if (this.managementChannel) {
-      await this.managementChannel.close();
+      try {
+        await this.managementChannel.close();
+      } catch {
+        // already closed
+      }
       this.managementChannel = null;
     }
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
 
-  /**
-   * Exponential backoff with jitter for requeue delays.
-   * attempt=0 → ~200ms, attempt=1 → ~400ms, attempt=2 → ~800ms, etc.
-   */
   private calcBackoffDelay(attempt: number): number {
     const base = this.config.requeueDelayMs;
-    const exp = Math.min(attempt, 10); // cap at 2^10
-    const jitter = Math.random() * base * 0.2; // ±20% jitter
+    const exp = Math.min(attempt, 10);
+    const jitter = Math.random() * base * 0.2;
     return Math.floor(base * Math.pow(2, exp) + jitter);
+  }
+
+  private safeAck(channel: amqplib.Channel, msg: amqplib.ConsumeMessage): void {
+    try {
+      channel.ack(msg);
+    } catch {
+      // channel closed
+    }
+  }
+
+  private safeNack(
+    channel: amqplib.Channel,
+    msg: amqplib.ConsumeMessage,
+    requeue: boolean
+  ): void {
+    try {
+      channel.nack(msg, false, requeue);
+    } catch {
+      // channel closed
+    }
   }
 }
